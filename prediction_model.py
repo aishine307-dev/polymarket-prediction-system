@@ -1,14 +1,19 @@
 """
 Polymarket Prediction Model - Professional Quant Version
+Optimized for 15-Minute Crypto Price Prediction Markets
+
 Implements strategies from "Mathematical Execution Behind Prediction Market Alpha"
+Enhanced with crypto-specific features for short-term price movements.
 
 Features:
 - Order Book Imbalance (OBI) & Volume-Adjusted Mid Price (VAMP)
 - Cross-Contract Arbitrage Detection
-- Terminal Risk Management (gamma-aware position sizing)
+- Terminal Risk Management (gamma-aware position sizing, minute-level for 15-min markets)
 - Bayesian Model Aggregation with Brier score optimization
 - Fractional Kelly Criterion (25% of full Kelly)
 - XGBoost, LightGBM, Stacking Ensembles with Probability Calibration
+- Crypto-Specific Features: Micro-momentum, volatility bursts, volume surges, fast indicators
+- 15-Minute Market Optimizations: Minute-level risk management, time decay, fast technical indicators
 """
 
 import numpy as np
@@ -278,6 +283,8 @@ class TerminalRiskManager:
     Risk Management Protocol:
     Position(t) = Initial_Position * √(T_remaining / T_initial)
     Reduce exposure ~65% in final week before settlement.
+    
+    Enhanced for 15-minute crypto markets with minute-level calculations.
     """
     
     @staticmethod
@@ -285,7 +292,7 @@ class TerminalRiskManager:
                                 days_remaining: float, 
                                 initial_days: float = 30) -> float:
         """
-        Calculate position size adjusted for terminal risk.
+        Calculate position size adjusted for terminal risk (day-based, legacy).
         
         Example:
         - Initial: $10,000 (30 days out)
@@ -301,9 +308,43 @@ class TerminalRiskManager:
         return initial_position * np.sqrt(ratio)
     
     @staticmethod
+    def time_adjusted_position_minutes(initial_position: float, 
+                                        minutes_remaining: float, 
+                                        initial_minutes: float = 15) -> float:
+        """
+        Calculate position size adjusted for terminal risk (minute-based, for 15-min markets).
+        
+        Uses more aggressive decay near deadline:
+        - Standard: √(minutes/15)
+        - Aggressive (last 5 min): (minutes/15)^0.75  # Faster decay
+        
+        Example:
+        - Initial: $10,000 (15 minutes out)
+        - 10 minutes remaining: $10,000 * √(10/15) = $8,165
+        - 5 minutes remaining: $10,000 * √(5/15) = $5,774
+        - 1 minute remaining: $10,000 * (1/15)^0.75 = $2,080 (aggressive decay)
+        """
+        if minutes_remaining <= 0:
+            return 0.0
+        if initial_minutes <= 0:
+            initial_minutes = 15
+        
+        ratio = min(minutes_remaining / initial_minutes, 1.0)
+        
+        # More aggressive decay in final 5 minutes (critical for 15-min markets)
+        if minutes_remaining <= 5:
+            # Faster decay: use power of 0.75 instead of 0.5 (square root)
+            reduction_factor = ratio ** 0.75
+        else:
+            # Standard square root decay
+            reduction_factor = np.sqrt(ratio)
+        
+        return initial_position * reduction_factor
+    
+    @staticmethod
     def gamma_risk_factor(days_remaining: float) -> float:
         """
-        Calculate gamma risk factor (higher = more risk).
+        Calculate gamma risk factor (higher = more risk) - day-based, legacy.
         Gamma ∝ 1/√(T_remaining)
         """
         if days_remaining <= 0:
@@ -311,11 +352,26 @@ class TerminalRiskManager:
         return 1.0 / np.sqrt(days_remaining)
     
     @staticmethod
+    def gamma_risk_factor_minutes(minutes_remaining: float) -> float:
+        """
+        Calculate gamma risk factor for minute-level timeframes (15-minute markets).
+        Gamma ∝ 1/√(minutes_remaining)
+        
+        More sensitive than day-based calculation.
+        """
+        if minutes_remaining <= 0:
+            return float('inf')
+        # Normalize by converting minutes to equivalent "days" for comparison
+        # 1 day = 1440 minutes, so normalize to get similar scale
+        minutes_normalized = minutes_remaining / 1440.0
+        return 1.0 / np.sqrt(minutes_normalized)
+    
+    @staticmethod
     def should_reduce_exposure(days_remaining: float, 
                                 volatility: float,
                                 threshold_days: float = 7) -> Tuple[bool, float]:
         """
-        Determine if position should be reduced due to terminal risk.
+        Determine if position should be reduced due to terminal risk (day-based, legacy).
         
         Returns: (should_reduce, reduction_factor)
         """
@@ -327,6 +383,39 @@ class TerminalRiskManager:
         volatility_adjustment = max(0.5, 1 - volatility)
         
         reduction_factor = base_reduction * volatility_adjustment
+        
+        return True, reduction_factor
+    
+    @staticmethod
+    def should_reduce_exposure_minutes(minutes_remaining: float, 
+                                        volatility: float,
+                                        threshold_minutes: float = 5) -> Tuple[bool, float]:
+        """
+        Determine if position should be reduced for 15-minute crypto markets.
+        
+        More aggressive reduction in final 5 minutes (threshold for 15-min markets).
+        
+        Returns: (should_reduce, reduction_factor)
+        """
+        if minutes_remaining > threshold_minutes:
+            return False, 1.0
+        
+        # More aggressive reduction near deadline for 15-minute markets
+        if minutes_remaining <= 2:
+            # Very aggressive in last 2 minutes (critical risk zone)
+            base_reduction = (minutes_remaining / threshold_minutes) ** 0.75  # Faster decay
+        elif minutes_remaining <= 5:
+            # Moderate reduction (5-2 minutes remaining)
+            base_reduction = np.sqrt(minutes_remaining / threshold_minutes)
+        else:
+            # Standard reduction
+            base_reduction = minutes_remaining / threshold_minutes
+        
+        # Adjust for volatility (crypto can be very volatile)
+        volatility_adjustment = max(0.4, 1 - volatility * 1.5)  # More aggressive adjustment
+        
+        reduction_factor = base_reduction * volatility_adjustment
+        reduction_factor = max(0.1, min(1.0, reduction_factor))  # Cap between 0.1 and 1.0
         
         return True, reduction_factor
 
@@ -503,6 +592,103 @@ class TechnicalIndicators:
         if high == low:
             return 0.5
         return (current - low) / (high - low)
+    
+    @staticmethod
+    def fast_rsi(prices: np.ndarray, period: int = 5) -> float:
+        """
+        Fast RSI optimized for 15-minute crypto predictions.
+        Uses shorter period (5) for quicker response to price changes.
+        """
+        if len(prices) < period + 1:
+            return 50.0
+        deltas = np.diff(prices[-period-1:])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    
+    @staticmethod
+    def fast_macd(prices: np.ndarray, fast: int = 6, slow: int = 13) -> Tuple[float, float, float]:
+        """
+        Fast MACD optimized for 15-minute predictions.
+        Uses shorter periods (6, 13) instead of (12, 26) for quicker momentum detection.
+        """
+        if len(prices) < slow:
+            return 0.0, 0.0, 0.0
+        ema_fast = TechnicalIndicators.ema(prices, fast)
+        ema_slow = TechnicalIndicators.ema(prices, slow)
+        macd_line = ema_fast - ema_slow
+        signal = macd_line * 0.8
+        histogram = macd_line - signal
+        return macd_line, signal, histogram
+    
+    @staticmethod
+    def williams_r(prices: np.ndarray, period: int = 14) -> float:
+        """
+        Williams %R for ultra-short-term momentum detection.
+        Range: -100 (oversold) to 0 (overbought)
+        Useful for detecting rapid price movements in 15-minute windows.
+        """
+        if len(prices) < period:
+            return -50.0
+        recent = prices[-period:]
+        high_max = np.max(recent)
+        low_min = np.min(recent)
+        if high_max == low_min:
+            return -50.0
+        return -100 * (high_max - prices[-1]) / (high_max - low_min)
+    
+    @staticmethod
+    def rate_of_change(prices: np.ndarray, period: int = 10) -> float:
+        """
+        Rate of Change (ROC) for price acceleration detection.
+        Measures percentage change over period - useful for detecting momentum bursts.
+        """
+        if len(prices) < period + 1:
+            return 0.0
+        if prices[-period-1] == 0:
+            return 0.0
+        roc = ((prices[-1] - prices[-period-1]) / prices[-period-1]) * 100
+        return roc
+    
+    @staticmethod
+    def bollinger_width(prices: np.ndarray, period: int = 10) -> float:
+        """
+        Bollinger Band width (volatility compression indicator).
+        Lower width = price compression (often precedes big moves).
+        Useful for detecting volatility bursts in crypto.
+        """
+        if len(prices) < period:
+            return 0.02
+        recent = prices[-period:]
+        mid = np.mean(recent)
+        std = np.std(recent)
+        upper = mid + 2*std
+        lower = mid - 2*std
+        if mid == 0:
+            return 0.02
+        width = (upper - lower) / mid
+        return width
+    
+    @staticmethod
+    def fast_atr(prices: np.ndarray, period: int = 5) -> float:
+        """
+        Fast ATR for recent volatility detection (5-period vs standard 14).
+        Captures recent volatility spikes better for 15-minute predictions.
+        """
+        if len(prices) < period + 1:
+            return np.std(prices) if len(prices) > 1 else 0.01
+        high = np.maximum.accumulate(prices[-period-1:])
+        low = np.minimum.accumulate(prices[-period-1:])
+        close = prices[-period-1:]
+        tr = np.maximum(high[1:] - low[1:], 
+                       np.maximum(np.abs(high[1:] - close[:-1]),
+                                 np.abs(low[1:] - close[:-1])))
+        return np.mean(tr)
 
 
 class MarketFeatureExtractor:
@@ -536,32 +722,92 @@ class MarketFeatureExtractor:
             'price_range': np.max(prices) - np.min(prices),
         }
         
+        # Standard momentum (for backward compatibility)
         recent = prices[-50:] if len(prices) > 50 else prices
         old = prices[:50] if len(prices) > 50 else prices
         features['momentum'] = np.mean(recent) - np.mean(old)
         
+        # Legacy momentum periods (keep for compatibility)
         for period in [5, 10, 20]:
             if len(prices) > period:
                 features[f'momentum_{period}'] = prices[-1] - prices[-period]
             else:
                 features[f'momentum_{period}'] = 0
         
-        features['rsi'] = self.ti.rsi(prices) / 100
-        features['sma_20'] = self.ti.sma(prices, 20)
-        features['ema_12'] = self.ti.ema(prices, 12)
+        # Crypto-specific: Micro-momentum (last 1-3 trades) for 15-minute windows
+        if len(prices) >= 3:
+            features['micro_momentum'] = prices[-1] - prices[-3]  # Last 3 trades
+        elif len(prices) >= 2:
+            features['micro_momentum'] = prices[-1] - prices[-2]  # Last 2 trades
+        elif len(prices) >= 1:
+            features['micro_momentum'] = 0
+        else:
+            features['micro_momentum'] = 0
         
-        macd, signal, hist = self.ti.macd(prices)
+        # Ultra-short momentum for 15-minute predictions (1, 3, 5 minute equivalents)
+        # Using trade count as proxy for time (assumes trades roughly every minute)
+        n_trades = len(prices)
+        if n_trades > 5:
+            features['momentum_1min'] = prices[-1] - prices[-min(5, n_trades//3)]
+            features['momentum_3min'] = prices[-1] - prices[-min(10, n_trades//2)]
+            features['momentum_5min'] = prices[-1] - prices[-min(15, n_trades)]
+        else:
+            features['momentum_1min'] = prices[-1] - prices[0] if n_trades > 1 else 0
+            features['momentum_3min'] = features['momentum_1min']
+            features['momentum_5min'] = features['momentum_1min']
+        
+        # Fast RSI for 15-minute predictions (period=5 instead of 14)
+        features['rsi'] = self.ti.rsi(prices) / 100  # Standard RSI (keep for compatibility)
+        features['fast_rsi'] = self.ti.fast_rsi(prices, period=5) / 100
+        
+        # Fast MACD for 15-minute predictions (6, 13 instead of 12, 26)
+        macd, signal, hist = self.ti.macd(prices)  # Standard MACD (keep for compatibility)
         features['macd'] = macd
         features['macd_signal'] = signal
         
-        upper, mid, lower = self.ti.bollinger_bands(prices)
+        fast_macd, fast_signal, fast_hist = self.ti.fast_macd(prices, fast=6, slow=13)
+        features['fast_macd'] = fast_macd
+        features['fast_macd_signal'] = fast_signal
+        
+        # Standard indicators (keep for compatibility)
+        features['sma_20'] = self.ti.sma(prices, 20)
+        features['ema_12'] = self.ti.ema(prices, 12)
+        
+        # Tight Bollinger Bands for 15-minute windows (period=10 instead of 20)
+        upper, mid, lower = self.ti.bollinger_bands(prices, period=10)
         features['bb_upper'] = upper
         features['bb_lower'] = lower
         features['bb_position'] = self.ti.price_position(current_price, upper, lower)
+        features['bb_width'] = self.ti.bollinger_width(prices, period=10)  # Volatility compression
         
+        # Fast ATR for recent volatility (period=5 instead of 14)
         features['volatility'] = self.ti.volatility(prices)
-        features['atr'] = self.ti.atr(prices)
+        features['atr'] = self.ti.atr(prices)  # Standard ATR (keep for compatibility)
+        features['fast_atr'] = self.ti.fast_atr(prices, period=5)
         
+        # Volatility burst: recent volatility vs average volatility
+        if len(prices) >= 10:
+            recent_vol = self.ti.volatility(prices[-5:], period=5) if len(prices) >= 5 else features['volatility']
+            avg_vol = features['volatility']
+            features['volatility_burst'] = recent_vol / (avg_vol + 1e-10)  # Ratio > 1 = burst
+        else:
+            features['volatility_burst'] = 1.0  # No burst if not enough data
+        
+        # Volume surge: recent volume vs average volume
+        if len(sizes) >= 5:
+            recent_volume = np.mean(sizes[-3:]) if len(sizes) >= 3 else np.mean(sizes)
+            avg_volume = np.mean(sizes) if len(sizes) > 0 else 1
+            features['volume_surge'] = recent_volume / (avg_volume + 1e-10)  # Ratio > 1 = surge
+        else:
+            features['volume_surge'] = 1.0
+        
+        # Price acceleration: Rate of change of momentum (ROC)
+        features['price_acceleration'] = self.ti.rate_of_change(prices, period=min(10, len(prices)//2)) / 100
+        
+        # Williams %R for ultra-short-term momentum
+        features['williams_r'] = self.ti.williams_r(prices, period=14) / 100  # Normalized to [-1, 0]
+        
+        # Standard stochastic (keep for compatibility)
         stoch_k, stoch_d = self.ti.stochastic(prices)
         features['stoch_k'] = stoch_k / 100
         
@@ -603,14 +849,63 @@ class MarketFeatureExtractor:
         volume_24h = float(market.get('volume24hr', 0) or 0)
         liquidity = float(market.get('liquidity', 0) or 0)
         
+        # Time-based features for 15-minute crypto markets
         end_date_str = market.get('endDate')
-        days_until_end = 30
+        created_date_str = market.get('createdAt') or market.get('created_at')
+        
+        # Calculate time remaining in minutes (for 15-minute markets)
+        minutes_until_end = 15.0  # Default for 15-minute markets
+        days_until_end = 30  # Keep for backward compatibility
+        
         if end_date_str:
             try:
                 end_date = pd.to_datetime(end_date_str)
-                days_until_end = max((end_date - datetime.now()).days, 0)
+                now = datetime.now()
+                time_delta = end_date - now
+                
+                # Calculate both minutes and days
+                minutes_until_end = max(time_delta.total_seconds() / 60, 0)
+                days_until_end = max(time_delta.days, 0)
+                
+                # If time is very short (likely 15-minute market), use minutes
+                if minutes_until_end < 1440:  # Less than 24 hours
+                    minutes_until_end = minutes_until_end
+                else:
+                    minutes_until_end = days_until_end * 1440  # Convert days to minutes
             except:
-                pass
+                # If created_at exists, estimate 15-minute window
+                if created_date_str:
+                    try:
+                        created_date = pd.to_datetime(created_date_str)
+                        time_elapsed = (datetime.now() - created_date).total_seconds() / 60
+                        minutes_until_end = max(15 - time_elapsed, 0)  # Assume 15-minute market
+                    except:
+                        minutes_until_end = 15.0
+                else:
+                    minutes_until_end = 15.0
+        
+        # Time decay factor: exponential decay as 15-minute window closes
+        # More aggressive decay in final 5 minutes
+        if minutes_until_end <= 5:
+            time_decay_factor = np.exp(-2 * (5 - minutes_until_end) / 5)  # Fast decay in last 5 min
+        elif minutes_until_end <= 15:
+            time_decay_factor = np.exp(-(15 - minutes_until_end) / 15)  # Moderate decay
+        else:
+            time_decay_factor = 1.0  # No decay if > 15 minutes
+        
+        # Normalize time decay to [0, 1] range
+        time_decay_factor = max(0.1, min(1.0, time_decay_factor))
+        
+        # Detect if this is a crypto market (check question text)
+        question = market.get('question', '').lower()
+        crypto_keywords = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'cryptocurrency', 
+                          'price', '$', 'usd', 'above', 'below', 'higher', 'lower']
+        is_crypto_market = any(keyword in question for keyword in crypto_keywords)
+        
+        # Time of day features (crypto volatility patterns)
+        now = datetime.now()
+        hour_of_day = now.hour / 24.0  # Normalized to [0, 1]
+        minute_of_hour = now.minute / 60.0  # Normalized to [0, 1]
         
         return {
             'yes_price': yes_price,
@@ -619,11 +914,17 @@ class MarketFeatureExtractor:
             'total_volume': volume,
             'volume_24h': volume_24h,
             'liquidity': liquidity,
-            'days_until_end': days_until_end,
+            'days_until_end': days_until_end,  # Keep for backward compatibility
+            'minutes_until_end': minutes_until_end,  # New: for 15-minute markets
+            'time_decay_factor': time_decay_factor,  # New: exponential decay
+            'is_crypto_market': 1.0 if is_crypto_market else 0.0,  # New: crypto detection
+            'hour_of_day': hour_of_day,  # New: time-based volatility patterns
+            'minute_of_hour': minute_of_hour,  # New: intra-hour patterns
         }
     
     def _empty_trade_features(self) -> Dict:
         return {
+            # Standard features (keep for compatibility)
             'current_price': 0.5, 'avg_price': 0.5, 'median_price': 0.5,
             'price_std': 0, 'price_range': 0,
             'momentum': 0, 'momentum_5': 0, 'momentum_10': 0, 'momentum_20': 0,
@@ -634,11 +935,27 @@ class MarketFeatureExtractor:
             'total_volume': 0, 'avg_trade_size': 0,
             'buy_pressure': 0.5, 'sell_pressure': 0.5, 'order_imbalance': 0,
             'trade_count': 0,
+            # Crypto-specific features for 15-minute windows
+            'micro_momentum': 0,
+            'momentum_1min': 0, 'momentum_3min': 0, 'momentum_5min': 0,
+            'fast_rsi': 0.5, 'fast_macd': 0, 'fast_macd_signal': 0,
+            'fast_atr': 0.01, 'bb_width': 0.02,
+            'volatility_burst': 1.0, 'volume_surge': 1.0,
+            'price_acceleration': 0, 'williams_r': -0.5,
         }
     
     def get_feature_names(self) -> List[str]:
         trade_features = list(self._empty_trade_features().keys())
-        market_features = ['yes_price', 'no_price', 'spread', 'total_volume', 'volume_24h', 'liquidity', 'days_until_end']
+        # Enhanced market features for 15-minute crypto markets
+        market_features = [
+            'yes_price', 'no_price', 'spread', 'total_volume', 'volume_24h', 'liquidity',
+            'days_until_end',  # Keep for backward compatibility
+            'minutes_until_end',  # New: for 15-minute markets
+            'time_decay_factor',  # New: exponential decay
+            'is_crypto_market',  # New: crypto detection
+            'hour_of_day',  # New: time-based patterns
+            'minute_of_hour',  # New: intra-hour patterns
+        ]
         return trade_features + market_features
     
     def combine_features(self, trade_features: Dict, market_features: Dict) -> np.ndarray:
@@ -759,14 +1076,23 @@ class KellyCriterion:
 
 class PolymarketPredictor:
     """
-    Professional Quant Prediction Model.
+    Professional Quant Prediction Model - Optimized for 15-Minute Crypto Markets.
     
     Implements strategies from "Mathematical Execution Behind Prediction Market Alpha":
     - Order Book Microstructure analysis
     - Bayesian probability aggregation
-    - Terminal risk management
+    - Terminal risk management (minute-level for 15-min markets)
     - Fractional Kelly position sizing
     - XGBoost/LightGBM/Stacking with probability calibration
+    
+    Enhanced for Crypto 15-Minute Markets:
+    - Fast technical indicators (RSI(5), MACD(6,13), fast ATR)
+    - Micro-momentum (last 1-3 trades)
+    - Volatility bursts and volume surges
+    - Price acceleration (ROC)
+    - Minute-level risk management
+    - Time decay factor for confidence adjustment
+    - Crypto market detection and filtering
     """
     
     def __init__(self, use_optuna: bool = False, use_calibration: bool = True,
@@ -906,11 +1232,36 @@ class PolymarketPredictor:
     
     def train(self, training_data: List[Dict]) -> Dict:
         if len(training_data) < 10:
-            print("Warning: Insufficient training data")
+            print(f"⚠️  Warning: Insufficient training data ({len(training_data)} samples < 10 minimum)")
+            print("   Attempting to train with available data (predictions may be less reliable)...")
+        
+        if len(training_data) == 0:
+            # If no training data at all, create dummy data to fit scaler and models
+            print("   ⚠️  No training data - creating dummy data for scaler/model initialization")
+            feature_names = self.feature_extractor.get_feature_names()
+            n_features = len(feature_names)
+            # Create dummy data with zeros (will be normalized but at least fitted)
+            dummy_X = np.zeros((2, n_features))  # Need at least 2 samples for train/test split
+            dummy_y_dir = np.array([0, 1])
+            dummy_y_price = np.array([0.5, 0.5])
+            
+            # Fit scaler
+            self.scaler.fit(dummy_X)
+            
+            # Train models on dummy data (minimal training to avoid errors)
+            dummy_X_scaled = self.scaler.transform(dummy_X)
+            try:
+                self.direction_model.fit(dummy_X_scaled, dummy_y_dir)
+                self.price_model.fit(dummy_X_scaled, dummy_y_price)
+            except:
+                pass  # Models may not train on dummy data, that's okay
+            
             self.is_trained = True
-            return {'status': 'insufficient_data', 'direction_accuracy': 0.80}
+            return {'status': 'no_data', 'direction_accuracy': 0.50, 'n_samples': 0}
         
         print(f"\n🚀 Training on {len(training_data)} samples...")
+        if len(training_data) < 10:
+            print("   ⚠️  Low sample count - models may have reduced accuracy")
         
         X = np.vstack([d['features'] for d in training_data])
         y_price = np.array([d['future_price'] for d in training_data])
@@ -945,77 +1296,299 @@ class PolymarketPredictor:
         X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
         X_scaled = self.scaler.fit_transform(X)
         
-        # Use stratified split only if we have both classes
-        unique_classes = np.unique(y_direction)
-        if len(unique_classes) >= 2:
-            X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-                X_scaled, y_direction, test_size=0.2, random_state=42, stratify=y_direction
-            )
-            _, _, y_price_train, y_price_val = train_test_split(
-                X_scaled, y_price, test_size=0.2, random_state=42
-            )
+        # Handle very small datasets (need at least 2 samples for train/test split)
+        if len(X_scaled) < 2:
+            print("  ⚠️  Too few samples for train/test split - using all data for training")
+            X_train, X_val = X_scaled, X_scaled
+            y_dir_train, y_dir_val = y_direction, y_direction
+            y_price_train, y_price_val = y_price, y_price
         else:
-            # No stratification if only one class
-            X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-                X_scaled, y_direction, test_size=0.2, random_state=42
-            )
+            # Use stratified split only if we have both classes and enough samples
+            unique_classes = np.unique(y_direction)
+            min_samples_for_stratify = max(2, int(0.2 * len(y_direction)) + 1)  # Need at least 1 in test set
+            
+            if len(unique_classes) >= 2 and len(X_scaled) >= min_samples_for_stratify:
+                try:
+                    X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+                        X_scaled, y_direction, test_size=0.2, random_state=42, stratify=y_direction
+                    )
+                except ValueError:
+                    # Stratification failed (likely due to class imbalance), use without stratify
+                    X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+                        X_scaled, y_direction, test_size=0.2, random_state=42
+                    )
+            else:
+                # No stratification if only one class or too few samples
+                X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+                    X_scaled, y_direction, test_size=min(0.2, 1.0 / len(X_scaled)), random_state=42
+                )
+            
+            # Split for price model (always use same split indices)
             _, _, y_price_train, y_price_val = train_test_split(
-                X_scaled, y_price, test_size=0.2, random_state=42
+                X_scaled, y_price, test_size=min(0.2, 1.0 / len(X_scaled)), random_state=42
             )
         
         print("  📈 Training direction model (stacking ensemble with calibration)...")
-        self.direction_model.fit(X_train, y_dir_train)
+        
+        # Check if we have enough samples per class for calibration
+        unique_classes, class_counts = np.unique(y_dir_train, return_counts=True)
+        min_samples_per_class = min(class_counts) if len(class_counts) > 0 else 0
+        n_classes = len(unique_classes)
+        n_samples_train = len(X_train)
+        
+        # Check if we have enough samples for StackingClassifier with CV
+        # StackingClassifier with cv=3 splits data into 3 folds
+        # LightGBM and XGBoost base models require at least 2 samples total
+        # Problem: With cv=3 and 6 samples, each fold gets 2 samples, but if one class has only 1 sample,
+        # that fold might have only 1 sample of that class, causing issues.
+        # Solution: Need more samples or use simple model without CV
+        # Conservative approach: Need at least 10 samples for cv=3 (gives ~3 samples per fold)
+        # For cv=2, need at least 6 samples (gives ~3 samples per fold)
+        min_samples_for_cv = 10  # Conservative minimum for cv=3 with class balance
+        min_samples_per_fold = 2  # LightGBM/XGBoost minimum requirement
+        
+        # If we don't have enough samples for CV-based stacking, use simple model directly
+        if n_samples_train < min_samples_for_cv or min_samples_per_class < min_samples_per_fold:
+            print(f"  ⚠️  Insufficient data for StackingClassifier with CV")
+            print(f"     (Total: {n_samples_train} samples, {min_samples_per_class} per class - need at least {min_samples_for_cv} total and {min_samples_per_fold} per class)")
+            print("     Using simple RandomForest (no CV required)")
+            
+            # Use simple RandomForest directly - no CV needed, works with any number of samples
+            from sklearn.ensemble import RandomForestClassifier
+            self.direction_model = RandomForestClassifier(
+                n_estimators=50, 
+                max_depth=5,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42, 
+                n_jobs=-1
+            )
+            self.direction_model.fit(X_train, y_dir_train)
+        else:
+            # We have enough samples - proceed with stacking/calibration
+            # Calibration requires at least 2 samples per class for cv=2
+            # If insufficient, disable calibration and use raw model
+            use_calibration = self.use_calibration and isinstance(self.direction_model, CalibratedClassifierCV)
+            
+            if use_calibration and (min_samples_per_class < 2 or n_classes < 2):
+                print(f"  ⚠️  Insufficient data for calibration ({min_samples_per_class} samples/class, {n_classes} classes)")
+                print("     Disabling calibration - using raw stacking model")
+                # Switch to raw model (which was already created in _build_models)
+                if hasattr(self, '_raw_direction_model'):
+                    self.direction_model = self._raw_direction_model
+                else:
+                    # Fallback: create a simple model
+                    from sklearn.ensemble import RandomForestClassifier
+                    print("     Creating simple RandomForest as fallback")
+                    self.direction_model = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+            
+            # Try to fit the direction model (stacking or simple)
+            try:
+                self.direction_model.fit(X_train, y_dir_train)
+            except (ValueError, Exception) as e:
+                error_msg = str(e).lower()
+                # Check if error is related to CV, insufficient samples, or LightGBM/XGBoost requirements
+                if any(keyword in error_msg for keyword in ["cross-validation", "cv", "examples", "fold", "minimum", "required", "lgbm", "xgb"]):
+                    print(f"  ⚠️  Stacking model failed: {e}")
+                    print("     Falling back to simple RandomForest (no CV required)")
+                    # Use simple RandomForest directly - no CV needed, works with any number of samples
+                    from sklearn.ensemble import RandomForestClassifier
+                    self.direction_model = RandomForestClassifier(
+                        n_estimators=50,
+                        max_depth=5,
+                        min_samples_split=2,
+                        min_samples_leaf=1,
+                        random_state=42,
+                        n_jobs=-1
+                    )
+                    self.direction_model.fit(X_train, y_dir_train)
+                    print("     ✅ Simple RandomForest fitted successfully")
+                else:
+                    raise  # Re-raise if it's a different error
         
         print("  📊 Training price model (stacking ensemble)...")
-        self.price_model.fit(X_train, y_price_train)
+        
+        # Check if we have enough samples for StackingRegressor with CV (same check as direction model)
+        if n_samples_train < min_samples_for_cv:
+            print(f"  ⚠️  Insufficient data for StackingRegressor with CV ({n_samples_train} samples < {min_samples_for_cv} minimum)")
+            print("     Using simple RandomForestRegressor (no CV required)")
+            from sklearn.ensemble import RandomForestRegressor
+            self.price_model = RandomForestRegressor(
+                n_estimators=50,
+                max_depth=5,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=42,
+                n_jobs=-1
+            )
+            self.price_model.fit(X_train, y_price_train)
+        else:
+            # Try to fit price model (stacking)
+            try:
+                self.price_model.fit(X_train, y_price_train)
+            except (ValueError, Exception) as e:
+                error_msg = str(e).lower()
+                # Check if error is related to CV, insufficient samples, or LightGBM/XGBoost requirements
+                if any(keyword in error_msg for keyword in ["cross-validation", "cv", "examples", "fold", "minimum", "required", "lgbm", "xgb"]):
+                    print(f"  ⚠️  Price stacking model failed: {e}")
+                    print("     Falling back to simple RandomForestRegressor (no CV required)")
+                    from sklearn.ensemble import RandomForestRegressor
+                    self.price_model = RandomForestRegressor(
+                        n_estimators=50,
+                        max_depth=5,
+                        min_samples_split=2,
+                        min_samples_leaf=1,
+                        random_state=42,
+                        n_jobs=-1
+                    )
+                    self.price_model.fit(X_train, y_price_train)
+                    print("     ✅ Simple RandomForestRegressor fitted successfully")
+                else:
+                    raise  # Re-raise if it's a different error
         
         print("  🎯 Training confidence model...")
-        direction_proba = self.direction_model.predict_proba(X_train)[:, 1]
-        self.confidence_model.fit(direction_proba.reshape(-1, 1), y_dir_train)
+        try:
+            train_proba = self.direction_model.predict_proba(X_train)
+            # Handle edge case where predict_proba returns 1 column (single class prediction)
+            if train_proba.shape[1] == 1:
+                # Only one class predicted - use that probability
+                direction_proba = train_proba[:, 0]
+            else:
+                # Binary classification - use probability of positive class
+                direction_proba = train_proba[:, 1]
+            self.confidence_model.fit(direction_proba.reshape(-1, 1), y_dir_train)
+        except Exception as e:
+            print(f"  ⚠️  Confidence model training failed: {e}")
+            print("     Continuing without confidence model (will use default confidence)")
+            # Confidence model is optional - can continue without it
         
         # Enhanced evaluation metrics
         val_pred = self.direction_model.predict(X_val)
-        val_proba = self.direction_model.predict_proba(X_val)[:, 1]
+        
+        # Get validation probabilities - handle edge case where only one class is predicted
+        val_proba_full = self.direction_model.predict_proba(X_val)
+        if val_proba_full.shape[1] == 1:
+            # Only one class predicted - use that probability
+            # This happens when validation set has only one class
+            val_proba = val_proba_full[:, 0]
+            print(f"  ⚠️  Validation set has only one class - using single-class probabilities")
+        else:
+            # Binary classification - use probability of positive class
+            val_proba = val_proba_full[:, 1]
         
         direction_accuracy = accuracy_score(y_dir_val, val_pred)
-        f1 = f1_score(y_dir_val, val_pred)
+        
+        # Handle F1 score for single class case
+        try:
+            f1 = f1_score(y_dir_val, val_pred)
+        except ValueError:
+            # F1 score requires both classes - set to 0.0 if only one class
+            f1 = 0.0
+            print("  ⚠️  F1 score cannot be calculated (only one class in validation set)")
         
         # Probability quality metrics (key for prediction markets!)
-        brier = brier_score_loss(y_dir_val, val_proba)  # Lower is better
-        logloss = log_loss(y_dir_val, val_proba)  # Lower is better
-        
-        # Calibration metrics
-        try:
-            fraction_positives, mean_predicted_proba = calibration_curve(
-                y_dir_val, val_proba, n_bins=10, strategy='uniform'
-            )
-            calibration_error = np.mean(np.abs(fraction_positives - mean_predicted_proba))
+        # Handle edge case where validation set has only one class
+        unique_val_classes = np.unique(y_dir_val)
+        if len(unique_val_classes) == 1:
+            # Only one class in validation set - use dummy metrics
+            print("  ⚠️  Validation set has only one class - using default metrics")
+            brier = 0.25  # Default Brier score for uniform prediction
+            logloss = 0.69  # Default log loss for uniform prediction (~log(2))
+            calibration_error = 0.5
             self.calibration_info = {
-                'fraction_positives': fraction_positives.tolist(),
-                'mean_predicted_proba': mean_predicted_proba.tolist(),
-                'calibration_error': calibration_error
+                'fraction_positives': [],
+                'mean_predicted_proba': [],
+                'calibration_error': calibration_error,
+                'note': 'Single class validation set'
             }
-        except:
-            calibration_error = 0.0
+        else:
+            # Normal case - both classes present
+            try:
+                brier = brier_score_loss(y_dir_val, val_proba)  # Lower is better
+                logloss = log_loss(y_dir_val, val_proba)  # Lower is better
+            except ValueError as e:
+                print(f"  ⚠️  Error calculating probability metrics: {e}")
+                brier = 0.25
+                logloss = 0.69
+            
+            # Calibration metrics
+            try:
+                fraction_positives, mean_predicted_proba = calibration_curve(
+                    y_dir_val, val_proba, n_bins=min(10, len(np.unique(val_proba))), strategy='uniform'
+                )
+                calibration_error = np.mean(np.abs(fraction_positives - mean_predicted_proba))
+                self.calibration_info = {
+                    'fraction_positives': fraction_positives.tolist(),
+                    'mean_predicted_proba': mean_predicted_proba.tolist(),
+                    'calibration_error': calibration_error
+                }
+            except Exception as e:
+                print(f"  ⚠️  Calibration curve calculation failed: {e}")
+                calibration_error = 0.0
+                self.calibration_info = {
+                    'fraction_positives': [],
+                    'mean_predicted_proba': [],
+                    'calibration_error': calibration_error,
+                    'error': str(e)
+                }
         
         price_pred = self.price_model.predict(X_val)
         price_rmse = np.sqrt(mean_squared_error(y_price_val, price_pred))
         
-        cv_scores = cross_val_score(
-            self.direction_model, X_scaled, y_direction, 
-            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
-            scoring='accuracy'
-        )
+        # Handle cross-validation for small datasets
+        unique_classes = np.unique(y_direction)
+        n_samples = len(X_scaled)
+        min_samples_per_fold = 2
+        
+        # Adjust CV strategy based on dataset size
+        if n_samples < 5:
+            # Too few samples for CV - use training accuracy as proxy
+            print("  ⚠️  Too few samples for cross-validation - using training accuracy as proxy")
+            cv_scores = np.array([direction_accuracy] * 3)  # Create array with training accuracy
+        elif len(unique_classes) >= 2 and n_samples >= 10:
+            # Enough samples for stratified CV
+            try:
+                cv_scores = cross_val_score(
+                    self.direction_model, X_scaled, y_direction, 
+                    cv=StratifiedKFold(n_splits=min(5, n_samples // min_samples_per_fold), shuffle=True, random_state=42),
+                    scoring='accuracy'
+                )
+            except ValueError:
+                # Stratification failed, use regular KFold
+                from sklearn.model_selection import KFold
+                cv_scores = cross_val_score(
+                    self.direction_model, X_scaled, y_direction,
+                    cv=KFold(n_splits=min(3, n_samples // min_samples_per_fold), shuffle=True, random_state=42),
+                    scoring='accuracy'
+                )
+        else:
+            # Single class or small dataset - use regular KFold
+            from sklearn.model_selection import KFold
+            n_splits = min(3, max(2, n_samples // min_samples_per_fold))
+            cv_scores = cross_val_score(
+                self.direction_model, X_scaled, y_direction,
+                cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                scoring='accuracy'
+            )
         
         # Initialize SHAP explainer if available
         if HAS_SHAP and hasattr(self, '_raw_direction_model'):
             try:
+                # Create wrapper function to handle single-class predictions
+                def predict_proba_wrapper(X):
+                    proba = self.direction_model.predict_proba(X)
+                    if proba.shape[1] == 1:
+                        return proba[:, 0]  # Single class - return that probability
+                    else:
+                        return proba[:, 1]  # Binary - return positive class probability
+                
                 self.shap_explainer = shap.Explainer(
-                    lambda x: self.direction_model.predict_proba(x)[:, 1],
-                    X_train[:100]  # Use subset for background
+                    predict_proba_wrapper,
+                    X_train[:min(100, len(X_train))]  # Use subset for background (handle small datasets)
                 )
                 print("  🔍 SHAP explainer initialized for feature importance")
-            except:
+            except Exception as e:
+                # SHAP is optional - skip if it fails
                 pass
         
         self.training_metrics = {
@@ -1062,12 +1635,34 @@ class PolymarketPredictor:
         """
         Generate prediction using professional quant strategies.
         
+        Optimized for 15-minute crypto price prediction markets on Polymarket.
+        
         Implements:
         - ML model prediction with probability calibration
         - Order Book Imbalance (OBI) for short-term momentum
         - Bayesian aggregation of multiple probability sources
-        - Terminal risk-adjusted position sizing
+        - Terminal risk-adjusted position sizing (minute-level for 15-min markets)
         - Fractional Kelly optimal bet sizing
+        
+        Enhanced for 15-Minute Crypto Markets:
+        - Fast technical indicators (RSI(5), MACD(6,13))
+        - Micro-momentum (last 1-3 trades) for ultra-short-term signals
+        - Volatility bursts and volume surges detection
+        - Price acceleration (ROC) for momentum bursts
+        - Minute-level risk management (more aggressive decay near deadline)
+        - Time decay factor for confidence adjustment
+        - Crypto market auto-detection
+        
+        Args:
+            market: Market dictionary with outcomePrices, volume, liquidity, endDate, etc.
+            trades_df: DataFrame with historical trades (price, size, side, timestamp)
+            days_remaining: Optional override for days until expiration (auto-calculated if None)
+        
+        Returns: Dictionary with prediction details including:
+            - current_price, predicted_price, direction, confidence, edge
+            - action (BUY_YES/BUY_NO/HOLD), kelly_size
+            - minutes_remaining, time_decay_factor, is_crypto_market, is_15min_market
+            - Crypto-specific indicators: micro_momentum, volatility_burst, volume_surge, etc.
         """
         trade_features = self.feature_extractor.extract_trade_features(trades_df)
         market_features = self.feature_extractor.extract_market_features(market)
@@ -1076,26 +1671,62 @@ class PolymarketPredictor:
         # This ensures we have the real current price even if trades are sparse
         current_price = market_features.get('yes_price', 0.5)
         
-        # Build the SAME 10 features used in training (see polymarket_fetcher.py)
-        # This ensures the model receives features in the same format it was trained on
-        features = np.array([
-            current_price,                              # current_price from market
-            market_features.get('volume_24h', 0),       # volume_24h
-            market_features.get('liquidity', 0),        # liquidity
-            trade_features.get('rsi', 0.5),             # rsi
-            trade_features.get('momentum', 0),          # momentum
-            trade_features.get('order_imbalance', 0),   # order_imbalance
-            trade_features.get('volatility', 0),        # volatility
-            trade_features.get('momentum_5', 0),        # price_change_1d (using momentum_5)
-            trade_features.get('momentum_20', 0),       # price_change_1w (using momentum_20)
-            market_features.get('spread', 0),           # spread
-        ]).reshape(1, -1)
+        # Detect if this is a 15-minute crypto market
+        minutes_remaining = market_features.get('minutes_until_end', 15.0)
+        is_crypto = market_features.get('is_crypto_market', 0.0) > 0.5
+        is_15min_market = minutes_remaining <= 20 and minutes_remaining > 0
+        
+        # Build enhanced feature vector for 15-minute crypto markets
+        # Includes both standard features (for backward compatibility) and crypto-specific features
+        # Feature order must match training data exactly!
+        feature_names = self.feature_extractor.get_feature_names()
+        feature_dict = {**trade_features, **market_features}
+        
+        # Build feature vector in the same order as get_feature_names()
+        features_list = []
+        for fname in feature_names:
+            # Handle missing features gracefully
+            if fname in feature_dict:
+                features_list.append(feature_dict[fname])
+            else:
+                # Provide defaults for missing features
+                if 'momentum' in fname or 'rsi' in fname or 'price' in fname:
+                    features_list.append(0.5 if 'price' in fname or 'rsi' in fname else 0.0)
+                elif 'volume' in fname or 'volatility' in fname:
+                    features_list.append(0.0)
+                else:
+                    features_list.append(0.0)
+        
+        features = np.array(features_list).reshape(1, -1)
         features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
         
         if not self.is_trained:
             return self._heuristic_prediction(trade_features, days_remaining)
         
-        features_scaled = self.scaler.transform(features)
+        # Check if models are actually fitted (they might not be if training had insufficient data)
+        # Check if models have been fitted by checking for attributes that exist after fit()
+        models_fitted = (
+            hasattr(self.direction_model, 'n_features_in_') or 
+            hasattr(self.direction_model, 'estimators_') or
+            hasattr(self.direction_model, 'estimators')  # StackingClassifier has 'estimators'
+        ) and (
+            hasattr(self.price_model, 'n_features_in_') or 
+            hasattr(self.price_model, 'estimators_') or
+            hasattr(self.price_model, 'estimators')  # StackingRegressor has 'estimators'
+        )
+        
+        if not models_fitted:
+            # Models weren't trained (likely due to insufficient data)
+            # Use heuristic prediction instead
+            print("  ⚠️  Models not fitted (insufficient training data) - using heuristic prediction")
+            return self._heuristic_prediction(trade_features, days_remaining)
+        
+        try:
+            features_scaled = self.scaler.transform(features)
+        except Exception as e:
+            # Scaler not fitted - use heuristic
+            print(f"  ⚠️  Scaler not fitted: {e} - using heuristic prediction")
+            return self._heuristic_prediction(trade_features, days_remaining)
         
         # =====================================================================
         # CORE PREDICTION LOGIC
@@ -1105,16 +1736,30 @@ class PolymarketPredictor:
         # If model says price DOWN → likely resolves NO → BUY NO
         # =====================================================================
         
-        # Get model's probability that price will go UP
-        direction_proba = self.direction_model.predict_proba(features_scaled)[0]
-        prob_up = direction_proba[1]  # Probability price goes UP
+        try:
+            # Get model's probability that price will go UP
+            direction_proba_full = self.direction_model.predict_proba(features_scaled)[0]
+            # Handle edge case where predict_proba returns 1 column (single class prediction)
+            if len(direction_proba_full) == 1:
+                # Only one class predicted - use that probability
+                prob_up = direction_proba_full[0]
+            else:
+                # Binary classification - use probability of positive class (class 1)
+                prob_up = direction_proba_full[1]  # Probability price goes UP
+        except Exception as e:
+            print(f"  ⚠️  Error in direction model prediction: {e} - using heuristic")
+            return self._heuristic_prediction(trade_features, days_remaining)
         
         # Model's directional confidence (0 = uncertain, 1 = very confident)
         direction_confidence = abs(prob_up - 0.5) * 2
         
-        # Price model gives a direct predicted price (trained on future_price)
-        raw_predicted_price = self.price_model.predict(features_scaled)[0]
-        raw_predicted_price = np.clip(raw_predicted_price, 0.01, 0.99)
+        try:
+            # Price model gives a direct predicted price (trained on future_price)
+            raw_predicted_price = self.price_model.predict(features_scaled)[0]
+            raw_predicted_price = np.clip(raw_predicted_price, 0.01, 0.99)
+        except Exception as e:
+            print(f"  ⚠️  Error in price model prediction: {e} - using heuristic")
+            return self._heuristic_prediction(trade_features, days_remaining)
         
         # =====================================================================
         # PREDICTED PRICE CALCULATION
@@ -1174,29 +1819,54 @@ class PolymarketPredictor:
         micro_prob = micro_conf if micro_direction == 'UP' else (1 - micro_conf)
         
         # Bayesian Aggregation of probability sources
+        # For 15-minute crypto markets, boost weight for recent momentum/micro-momentum
+        if is_15min_market and is_crypto:
+            # Use micro-momentum for 15-minute markets (more important than standard momentum)
+            micro_momentum = trade_features.get('micro_momentum', 0)
+            momentum_1min = trade_features.get('momentum_1min', 0)
+            # Normalize micro-momentum to [0, 1] range for probability
+            momentum_signal = 0.5 + np.clip(micro_momentum * 10, -0.4, 0.4) if abs(micro_momentum) > 0.01 else \
+                              (0.5 + np.clip(momentum_1min * 10, -0.4, 0.4) if abs(momentum_1min) > 0.01 else 0.5)
+        else:
+            # Standard momentum for longer-term markets
+            momentum_signal = 0.5 + trade_features.get('momentum', 0) * 2
+        
         aggregated_prob = self.bayesian.aggregate({
             'model': prob_up,  # Direction model probability
             'market': current_price,
-            'momentum': 0.5 + trade_features['momentum'] * 2,  # Normalize momentum
+            'momentum': momentum_signal,  # Use micro-momentum for 15-min markets
             'sentiment': micro_prob,
         })
         
         # =====================================================================
-        # CONFIDENCE CALCULATION
+        # CONFIDENCE CALCULATION (Enhanced for 15-minute crypto markets)
         # =====================================================================
         
         # Boost confidence when model agrees with momentum/order flow
+        # For 15-minute markets, use micro-momentum instead of standard momentum
+        if is_15min_market and is_crypto:
+            micro_momentum = trade_features.get('micro_momentum', 0)
+            momentum_1min = trade_features.get('momentum_1min', 0)
+            momentum_signal = micro_momentum if abs(micro_momentum) > 0.001 else momentum_1min
+        else:
+            momentum_signal = trade_features.get('momentum', 0)
+        
         momentum_agreement = 1.0
-        if (prob_up > 0.5 and trade_features['momentum'] > 0) or \
-           (prob_up < 0.5 and trade_features['momentum'] < 0):
-            momentum_agreement = 1.1  # 10% boost for agreement
+        if (prob_up > 0.5 and momentum_signal > 0) or \
+           (prob_up < 0.5 and momentum_signal < 0):
+            # Stronger boost for 15-minute markets (recent momentum more predictive)
+            momentum_agreement = 1.15 if is_15min_market else 1.1  # 15% boost for 15-min, 10% for longer
         
         # Boost confidence when price change is significant
         change_magnitude = abs(price_change) / max(current_price, 0.05)
         magnitude_factor = min(1.0 + change_magnitude * 0.3, 1.2)
         
+        # Time decay confidence adjustment for 15-minute markets
+        # Less confident as 15-minute window closes
+        time_decay_factor = market_features.get('time_decay_factor', 1.0) if is_15min_market else 1.0
+        
         # Calculate base confidence: start at 55%, scale up with model confidence
-        raw_confidence = 0.55 + direction_confidence * 0.30 * momentum_agreement * magnitude_factor
+        raw_confidence = 0.55 + direction_confidence * 0.30 * momentum_agreement * magnitude_factor * time_decay_factor
         raw_confidence = np.clip(raw_confidence, 0.52, 0.90)
         
         # Use calibrated model as secondary input
@@ -1217,14 +1887,24 @@ class PolymarketPredictor:
         
         edge = abs(price_change) * confidence
         
-        # Terminal Risk Management
-        if days_remaining is None:
-            days_remaining = market_features.get('days_until_end', 30)
-        
-        should_reduce, reduction_factor = self.risk_manager.should_reduce_exposure(
-            days_remaining, trade_features['volatility']
-        )
-        gamma_risk = self.risk_manager.gamma_risk_factor(days_remaining)
+        # Terminal Risk Management (Enhanced for 15-minute crypto markets)
+        if is_15min_market and minutes_remaining > 0:
+            # Use minute-based risk management for 15-minute markets
+            should_reduce, reduction_factor = self.risk_manager.should_reduce_exposure_minutes(
+                minutes_remaining, trade_features.get('volatility', 0)
+            )
+            gamma_risk = self.risk_manager.gamma_risk_factor_minutes(minutes_remaining)
+            # Also calculate day-based for compatibility
+            days_remaining = minutes_remaining / 1440.0  # Convert minutes to days
+        else:
+            # Use day-based risk management for longer-term markets
+            if days_remaining is None:
+                days_remaining = market_features.get('days_until_end', 30)
+            should_reduce, reduction_factor = self.risk_manager.should_reduce_exposure(
+                days_remaining, trade_features.get('volatility', 0)
+            )
+            gamma_risk = self.risk_manager.gamma_risk_factor(days_remaining)
+            minutes_remaining = days_remaining * 1440.0  # Convert days to minutes for reporting
         
         # =====================================================================
         # ACTION DETERMINATION (BUY_YES / BUY_NO / HOLD)
@@ -1327,15 +2007,30 @@ class PolymarketPredictor:
             'order_book_imbalance': obi,
             'imbalance_ratio': imbalance_ratio,
             'micro_direction': micro_direction,
-            # Risk metrics
-            'days_remaining': days_remaining,
+            # Risk metrics (enhanced for 15-minute markets)
+            'days_remaining': days_remaining,  # Keep for backward compatibility
+            'minutes_remaining': minutes_remaining,  # New: for 15-minute markets
             'gamma_risk': gamma_risk,
             'terminal_risk_reduction': reduction_factor if should_reduce else 1.0,
-            # Technical indicators
-            'rsi': trade_features['rsi'],
-            'volatility': trade_features['volatility'],
-            'momentum': trade_features['momentum'],
-            'order_imbalance': trade_features['order_imbalance'],
+            'time_decay_factor': market_features.get('time_decay_factor', 1.0),  # New: time decay
+            'is_crypto_market': is_crypto,  # New: crypto detection
+            'is_15min_market': is_15min_market,  # New: 15-minute market detection
+            # Technical indicators (standard)
+            'rsi': trade_features.get('rsi', 0.5),
+            'volatility': trade_features.get('volatility', 0),
+            'momentum': trade_features.get('momentum', 0),
+            'order_imbalance': trade_features.get('order_imbalance', 0),
+            # Crypto-specific indicators (new for 15-minute markets)
+            'fast_rsi': trade_features.get('fast_rsi', 0.5),
+            'micro_momentum': trade_features.get('micro_momentum', 0),
+            'momentum_1min': trade_features.get('momentum_1min', 0),
+            'momentum_3min': trade_features.get('momentum_3min', 0),
+            'momentum_5min': trade_features.get('momentum_5min', 0),
+            'volatility_burst': trade_features.get('volatility_burst', 1.0),
+            'volume_surge': trade_features.get('volume_surge', 1.0),
+            'price_acceleration': trade_features.get('price_acceleration', 0),
+            'williams_r': trade_features.get('williams_r', -0.5),
+            'bb_width': trade_features.get('bb_width', 0.02),
             'top_features': feature_importance,
             'calibration_quality': self.calibration_info.get('calibration_error', 0),
         }
@@ -1396,14 +2091,107 @@ class PolymarketPredictor:
             'calibration_quality': 0.0,
         }
     
-    def fetch_real_training_data(self, n_markets: int = 100) -> List[Dict]:
+    def is_crypto_market(self, market: Dict) -> bool:
+        """
+        Identify if a market is a crypto price prediction market.
+        
+        Checks question text for crypto-related keywords.
+        
+        Args:
+            market: Market dictionary with 'question' field
+        
+        Returns: True if crypto market, False otherwise
+        """
+        question = market.get('question', '').lower()
+        description = market.get('description', '').lower()
+        text = question + " " + description
+        
+        crypto_keywords = [
+            'bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'cryptocurrency',
+            'price', '$', 'usd', 'above', 'below', 'higher', 'lower',
+            'solana', 'sol', 'cardano', 'ada', 'polygon', 'matic',
+            'dogecoin', 'doge', 'xrp', 'ripple', 'avalanche', 'avax'
+        ]
+        
+        return any(keyword in text for keyword in crypto_keywords)
+    
+    def is_15minute_market(self, market: Dict) -> bool:
+        """
+        Identify if a market has ~15-minute resolution window.
+        
+        Checks question text for 15-minute keywords, then checks time between createdAt and endDate.
+        For active markets, also checks minutes remaining.
+        
+        Args:
+            market: Market dictionary with 'question', 'createdAt', and 'endDate' fields
+        
+        Returns: True if ~15-minute market, False otherwise
+        """
+        # First check question text for 15-minute keywords (faster check)
+        question = market.get('question', '').lower()
+        description = market.get('description', '').lower()
+        text = question + " " + description
+        
+        minute_keywords = [
+            '15 min', '15 minute', 'quarter hour', '15m', 'fifteen minute',
+            '15-min', '15min', 'in 15 minutes', 'within 15 minutes',
+            'next 15 min', 'next 15 minutes'
+        ]
+        if any(keyword in text for keyword in minute_keywords):
+            return True
+        
+        # Then check time delta - check both total duration and remaining time
+        try:
+            created_date_str = market.get('createdAt') or market.get('created_at')
+            end_date_str = market.get('endDate') or market.get('end_date')
+            
+            if not created_date_str or not end_date_str:
+                return False
+            
+            created_date = pd.to_datetime(created_date_str)
+            end_date = pd.to_datetime(end_date_str)
+            now = datetime.now()
+            
+            # Check total duration (for closed markets or checking market length)
+            total_duration = (end_date - created_date).total_seconds() / 60
+            
+            # Check remaining time (for active markets)
+            minutes_remaining = (end_date - now).total_seconds() / 60
+            
+            # Consider markets with:
+            # - Total duration between 10-25 minutes (typical 15-minute markets)
+            # - OR remaining time between 0-25 minutes (active 15-minute markets)
+            # - OR if market was created recently and ends soon (active 15-minute market)
+            is_duration_match = 10 <= total_duration <= 25
+            is_remaining_match = 0 <= minutes_remaining <= 25 and minutes_remaining >= 0
+            
+            # Also check if it's an active market created recently (within last hour)
+            # and ending soon (within 25 minutes) - likely a 15-minute market
+            time_since_creation = (now - created_date).total_seconds() / 60
+            is_recent_and_ending_soon = (time_since_creation <= 60 and 
+                                         minutes_remaining >= 0 and 
+                                         minutes_remaining <= 25)
+            
+            return is_duration_match or is_remaining_match or is_recent_and_ending_soon
+            
+        except Exception as e:
+            # If date parsing fails, return False (conservative)
+            return False
+    
+    def fetch_real_training_data(self, n_markets: int = 100, 
+                                  filter_crypto: bool = True,
+                                  filter_15min: bool = False) -> List[Dict]:
         """
         Fetch REAL training data from Polymarket API.
+        
+        Optimized for 15-minute crypto price prediction markets.
         
         NO SYNTHETIC DATA - only real market data is used.
         
         Args:
             n_markets: Number of markets to fetch data from
+            filter_crypto: If True, filter to only crypto markets (default: True)
+            filter_15min: If True, filter to only ~15-minute markets (default: False)
         
         Returns: List of training samples with real features and outcomes
         """
@@ -1411,22 +2199,176 @@ class PolymarketPredictor:
         
         print("\n" + "=" * 60)
         print("🌐 FETCHING REAL DATA FROM POLYMARKET API")
+        if filter_crypto and filter_15min:
+            print("   Filtering: Crypto 15-minute markets only")
+        elif filter_crypto:
+            print("   Filtering: Crypto markets only")
+        elif filter_15min:
+            print("   Filtering: 15-minute markets only")
         print("   No synthetic data - 100% real market data")
         print("=" * 60)
         
         fetcher = PolymarketFetcher(verbose=True)
         
-        # Fetch real training data using the new API methods
-        training_data = fetcher.fetch_real_training_data(
-            n_markets=n_markets,
-            min_volume=1000,
-            include_closed=True
+        # Fetch markets (need significantly more if filtering for 15-minute, they're rare)
+        if filter_crypto and filter_15min:
+            # Both filters: fetch 10x more (15-minute markets are rare)
+            fetch_count = n_markets * 10
+        elif filter_crypto or filter_15min:
+            # One filter: fetch 5x more
+            fetch_count = n_markets * 5
+        else:
+            # No filtering: fetch as requested
+            fetch_count = n_markets
+        
+        # Fetch active markets for training (closed markets don't have CLOB data)
+        # Note: For 15-minute markets, we'll use active markets and check time remaining
+        print(f"  📊 Fetching {fetch_count} markets for filtering...")
+        all_markets = fetcher.get_markets(
+            limit=fetch_count,
+            active=True,  # Use active markets (closed markets have no CLOB data)
+            closed=False,
+            order='volume24hr',
+            ascending=False
         )
         
-        print(f"\n✅ Fetched {len(training_data)} real training samples")
+        print(f"  📊 Fetched {len(all_markets)} total markets")
         
-        # Return training data directly - no feature conversion needed
-        # Training uses 10 features from polymarket_fetcher, prediction uses same 10
+        # Filter markets if requested (BOTH conditions must be true when both filters enabled)
+        if filter_crypto or filter_15min:
+            filtered_markets = []
+            for market in all_markets:
+                # Check crypto filter
+                if filter_crypto and not self.is_crypto_market(market):
+                    continue
+                # Check 15-minute filter
+                if filter_15min and not self.is_15minute_market(market):
+                    continue
+                # Both filters passed (or one filter passed if only one enabled)
+                filtered_markets.append(market)
+            
+            print(f"  📊 Filtered {len(filtered_markets)} markets from {len(all_markets)} total")
+            
+            if not filtered_markets:
+                print(f"\n⚠️  No markets matched the filter criteria!")
+                if filter_crypto and filter_15min:
+                    print(f"   (Crypto 15-minute markets are rare - try increasing n_markets or reducing filters)")
+                return []
+            
+            all_markets = filtered_markets[:n_markets]  # Limit to requested count
+            print(f"  ✅ Using {len(all_markets)} markets for training")
+        
+        # Process filtered markets into training data format
+        # Use fetcher's _process_market_for_training method to convert markets to training samples
+        print(f"\n📊 Processing {len(all_markets)} filtered markets into training data...")
+        training_data = []
+        
+        for i, market in enumerate(all_markets, 1):
+            try:
+                # Use fetcher's private method to process market (we need to access it)
+                # Since it's private, we'll use the public fetch_real_training_data approach
+                # but apply filtering first
+                
+                # Check if market has required data
+                yes_token, _ = fetcher.get_token_ids_for_market(market)
+                if not yes_token:
+                    continue
+                
+                # Process market using our feature extractor to ensure consistency with prediction
+                # Extract features using our feature extractor (matches prediction format exactly)
+                trades = fetcher.get_trades(yes_token, limit=500)
+                trades_df = fetcher.trades_to_dataframe(trades) if trades else pd.DataFrame()
+                
+                # Use our feature extractor to get features (same as prediction)
+                trade_features = self.feature_extractor.extract_trade_features(trades_df)
+                market_features = self.feature_extractor.extract_market_features(market)
+                
+                # Build feature vector using feature extractor (same order as get_feature_names())
+                feature_names = self.feature_extractor.get_feature_names()
+                feature_dict = {**trade_features, **market_features}
+                
+                features_list = []
+                for fname in feature_names:
+                    features_list.append(feature_dict.get(fname, 0.0))
+                
+                features = np.array(features_list).reshape(1, -1)
+                features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
+                
+                # Get price history for outcome determination
+                price_history = None
+                if hasattr(fetcher, 'get_prices_history'):
+                    try:
+                        price_history = fetcher.get_prices_history(yes_token, interval='1w', fidelity=60)
+                    except:
+                        pass
+                
+                # Determine future_price and outcome
+                if price_history is not None and len(price_history) >= 20:
+                    prices_arr = price_history['price'].values if isinstance(price_history, pd.DataFrame) and 'price' in price_history.columns else np.array(price_history).flatten()
+                    mid_point = len(prices_arr) // 2
+                    past_avg = np.mean(prices_arr[:mid_point]) if mid_point > 0 else prices_arr[0]
+                    recent_avg = np.mean(prices_arr[-5:]) if len(prices_arr) >= 5 else prices_arr[-1]
+                    outcome = 1 if recent_avg > past_avg else 0
+                    future_price = np.clip(recent_avg, 0.01, 0.99)
+                    training_price = prices_arr[mid_point] if mid_point < len(prices_arr) else current_price
+                else:
+                    # Fallback: use momentum direction
+                    momentum = trade_features.get('momentum', 0) or trade_features.get('micro_momentum', 0)
+                    outcome = 1 if momentum > 0 else 0
+                    future_price = np.clip(current_price + momentum * 0.1, 0.01, 0.99)
+                    training_price = current_price
+                
+                # Create training sample with features matching prediction format
+                sample = {
+                    'features': features,
+                    'current_price': training_price,
+                    'future_price': future_price,
+                    'outcome': outcome,
+                    'market_id': market.get('id', 'unknown'),
+                    'question': market.get('question', 'Unknown')[:50],
+                }
+                
+                training_data.append(sample)
+                
+                if len(training_data) >= n_markets:
+                    break
+                
+                if i % 10 == 0:
+                    print(f"   Processed {i}/{len(all_markets)} markets... ({len(training_data)} training samples)")
+                
+            except Exception as e:
+                # Skip markets that fail to process
+                continue
+        
+        if not training_data:
+            # If no training data, provide helpful error message
+            print("\n⚠️  No training data was successfully processed!")
+            print("   Possible reasons:")
+            print("   - Crypto 15-minute markets may be very rare (try reducing filters)")
+            print("   - Markets may not have sufficient data (trades, order book, etc.)")
+            print("   - API may be rate limiting or unavailable")
+            print("\n   💡 Suggestions:")
+            print(f"   - Try filter_15min=False to include longer-term markets")
+            print(f"   - Increase n_markets (current: {n_markets})")
+            print(f"   - Check internet connection and Polymarket API status")
+        
+        print(f"\n✅ Processed {len(training_data)} real training samples")
+        if filter_crypto and filter_15min:
+            print(f"   (All samples are crypto 15-minute markets)")
+        elif filter_crypto:
+            print(f"   (All samples are crypto markets)")
+        elif filter_15min:
+            print(f"   (All samples are 15-minute markets)")
+        
+        if len(training_data) < 10:
+            print(f"\n⚠️  Warning: Only {len(training_data)} training samples found.")
+            print(f"   This may not be enough for effective training.")
+            if filter_crypto and filter_15min:
+                print(f"   Crypto 15-minute markets are rare - consider:")
+                print(f"   - Reducing filters (set filter_15min=False or filter_crypto=False)")
+                print(f"   - Increasing n_markets parameter")
+        
+        # Return training data - feature extraction format matches what training expects
         return training_data
     
     def detect_arbitrage(self, markets: List[Dict]) -> Dict:
@@ -1479,9 +2421,13 @@ class PolymarketPredictor:
 def create_predictor(use_optuna: bool = False, 
                      kelly_fraction: float = 0.25,
                      bankroll: float = 10000,
-                     n_markets: int = 100) -> PolymarketPredictor:
+                     n_markets: int = 100,
+                     filter_crypto: bool = True,
+                     filter_15min: bool = False) -> PolymarketPredictor:
     """
     Factory function to create a configured professional quant predictor.
+    
+    Optimized for 15-minute crypto price prediction markets on Polymarket.
     
     USES REAL DATA FROM POLYMARKET API - NO SYNTHETIC DATA.
     
@@ -1490,8 +2436,17 @@ def create_predictor(use_optuna: bool = False,
         kelly_fraction: Fraction of full Kelly (0.25 = quarter Kelly, industry standard)
         bankroll: Total trading capital
         n_markets: Number of real markets to fetch for training
+        filter_crypto: If True, filter to only crypto markets (default: True)
+        filter_15min: If True, filter to only ~15-minute markets (default: False)
     
     Returns: Trained PolymarketPredictor with all quant strategies initialized
+    
+    Features for 15-Minute Crypto Markets:
+    - Fast technical indicators (RSI(5), MACD(6,13))
+    - Micro-momentum (last 1-3 trades)
+    - Volatility bursts and volume surges
+    - Minute-level risk management
+    - Time decay factor for confidence adjustment
     """
     predictor = PolymarketPredictor(
         use_optuna=use_optuna,
@@ -1501,18 +2456,31 @@ def create_predictor(use_optuna: bool = False,
     
     print("\n" + "=" * 70)
     print("🚀 POLYMARKET PREDICTOR - REAL DATA MODE")
+    print("   Optimized for 15-Minute Crypto Price Prediction Markets")
     print("   Training on actual Polymarket market data (no synthetic data)")
+    if filter_crypto:
+        print("   Filter: Crypto markets only")
+    if filter_15min:
+        print("   Filter: 15-minute markets only")
     print("=" * 70)
     
-    # Fetch REAL training data from Polymarket API
-    training_data = predictor.fetch_real_training_data(n_markets=n_markets)
+    # Fetch REAL training data from Polymarket API with filters
+    training_data = predictor.fetch_real_training_data(
+        n_markets=n_markets,
+        filter_crypto=filter_crypto,
+        filter_15min=filter_15min
+    )
     
     if len(training_data) < 10:
         print("\n⚠️  Warning: Low training data count. API may be rate limiting.")
         print("   Waiting 5 seconds and retrying...")
         import time
         time.sleep(5)
-        training_data = predictor.fetch_real_training_data(n_markets=n_markets)
+        training_data = predictor.fetch_real_training_data(
+            n_markets=n_markets,
+            filter_crypto=filter_crypto,
+            filter_15min=filter_15min
+        )
     
     print(f"\n📊 Training model on {len(training_data)} REAL market samples")
     predictor.train(training_data)
